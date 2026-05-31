@@ -464,3 +464,199 @@ class SCIMMembershipTests(TestCase):
                     ]
                 },
             )
+
+    def test_flatten_nested_groups(self):
+        """When flatten_nested_groups=True, the parent group's SCIM payload
+        includes members of all descendant groups, not just its direct members."""
+        config = ServiceProviderConfiguration.default()
+        config.patch.supported = True
+        parent_scim_id = generate_id()
+        child_scim_id = generate_id()
+        user_a_scim_id = generate_id()
+        user_b_scim_id = generate_id()
+
+        user_a = User.objects.create(username=generate_id())
+        user_b = User.objects.create(username=generate_id())
+
+        parent = Group.objects.create(name=generate_id())
+        child = Group.objects.create(name=generate_id())
+        child.parents.add(parent)
+
+        parent.users.add(user_a)
+        child.users.add(user_b)
+
+        with Mocker() as mocker:
+            mocker.get(
+                "https://localhost/ServiceProviderConfig",
+                json=config.model_dump(),
+            )
+            mocker.post(
+                "https://localhost/Users",
+                [
+                    {"json": {"id": user_a_scim_id}},
+                    {"json": {"id": user_b_scim_id}},
+                ],
+            )
+            mocker.post(
+                "https://localhost/Groups",
+                [
+                    {"json": {"id": child_scim_id}},
+                    {"json": {"id": parent_scim_id}},
+                ],
+            )
+            mocker.patch(
+                f"https://localhost/Groups/{child_scim_id}",
+                json={},
+            )
+            mocker.patch(
+                f"https://localhost/Groups/{parent_scim_id}",
+                json={},
+            )
+
+            self.configure(flatten_nested_groups=True)
+            scim_sync.send(self.provider.pk)
+
+            patch_bodies = [req.json() for req in mocker.request_history if req.method == "PATCH"]
+            parent_member_op_values = []
+            for body in patch_bodies:
+                for op in body.get("Operations", []):
+                    if op.get("path") == "members" and op.get("op") == "add":
+                        values = {m["value"] for m in op.get("value", [])}
+                        if user_b_scim_id in values:
+                            parent_member_op_values.append(values)
+            self.assertTrue(
+                any(
+                    {user_a_scim_id, user_b_scim_id}.issubset(values)
+                    for values in parent_member_op_values
+                ),
+                f"Expected parent PATCH to include nested user, got: {patch_bodies}",
+            )
+
+    def test_flatten_nested_groups_disabled(self):
+        """When flatten_nested_groups=False (default), nested members are NOT
+        propagated to the parent — only direct members of each group are sent."""
+        config = ServiceProviderConfiguration.default()
+        config.patch.supported = True
+        parent_scim_id = generate_id()
+        child_scim_id = generate_id()
+        user_a_scim_id = generate_id()
+        user_b_scim_id = generate_id()
+
+        user_a = User.objects.create(username=generate_id())
+        user_b = User.objects.create(username=generate_id())
+
+        parent = Group.objects.create(name=generate_id())
+        child = Group.objects.create(name=generate_id())
+        child.parents.add(parent)
+
+        parent.users.add(user_a)
+        child.users.add(user_b)
+
+        with Mocker() as mocker:
+            mocker.get(
+                "https://localhost/ServiceProviderConfig",
+                json=config.model_dump(),
+            )
+            mocker.post(
+                "https://localhost/Users",
+                [
+                    {"json": {"id": user_a_scim_id}},
+                    {"json": {"id": user_b_scim_id}},
+                ],
+            )
+            mocker.post(
+                "https://localhost/Groups",
+                [
+                    {"json": {"id": child_scim_id}},
+                    {"json": {"id": parent_scim_id}},
+                ],
+            )
+            mocker.patch(
+                f"https://localhost/Groups/{child_scim_id}",
+                json={},
+            )
+            mocker.patch(
+                f"https://localhost/Groups/{parent_scim_id}",
+                json={},
+            )
+
+            self.configure()
+            scim_sync.send(self.provider.pk)
+
+            patch_bodies = [req.json() for req in mocker.request_history if req.method == "PATCH"]
+            for body in patch_bodies:
+                for op in body.get("Operations", []):
+                    if op.get("path") == "members":
+                        values = {m["value"] for m in op.get("value", [])}
+                        self.assertNotIn(
+                            user_b_scim_id,
+                            values,
+                            f"user_b leaked into parent without flatten enabled: {body}",
+                        )
+
+    def test_flatten_nested_groups_signal_propagates_to_ancestors(self):
+        """When flatten_nested_groups=True, adding a user to a child group via
+        the M2M signal triggers a membership reconcile on every ancestor group
+        too — not just the child."""
+        config = ServiceProviderConfiguration.default()
+        config.patch.supported = True
+        parent_scim_id = generate_id()
+        child_scim_id = generate_id()
+        user_scim_id = generate_id()
+
+        parent = Group.objects.create(name=generate_id())
+        child = Group.objects.create(name=generate_id())
+        child.parents.add(parent)
+
+        # First pass: provision groups + (initially member-less) user
+        user = User.objects.create(username=generate_id())
+        with Mocker() as mocker:
+            mocker.get(
+                "https://localhost/ServiceProviderConfig",
+                json=config.model_dump(),
+            )
+            mocker.post(
+                "https://localhost/Users",
+                json={"id": user_scim_id},
+            )
+            mocker.post(
+                "https://localhost/Groups",
+                [{"json": {"id": child_scim_id}}, {"json": {"id": parent_scim_id}}],
+            )
+            self.configure(flatten_nested_groups=True)
+            scim_sync.send(self.provider.pk)
+
+        # Second pass: add user to CHILD; expect a PATCH on parent as well
+        with Mocker() as mocker:
+            mocker.get(
+                "https://localhost/ServiceProviderConfig",
+                json=config.model_dump(),
+            )
+            mocker.get(
+                f"https://localhost/Groups/{child_scim_id}",
+                json={},
+            )
+            mocker.get(
+                f"https://localhost/Groups/{parent_scim_id}",
+                json={},
+            )
+            mocker.patch(
+                f"https://localhost/Groups/{child_scim_id}",
+                json={},
+            )
+            mocker.patch(
+                f"https://localhost/Groups/{parent_scim_id}",
+                json={},
+            )
+            child.users.add(user)
+
+            patched_groups = [
+                req.url.rsplit("/", 1)[-1]
+                for req in mocker.request_history
+                if req.method == "PATCH"
+            ]
+            self.assertIn(
+                parent_scim_id,
+                patched_groups,
+                f"Expected ancestor PATCH; got patches on {patched_groups}",
+            )
