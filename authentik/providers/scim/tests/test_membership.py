@@ -7,7 +7,12 @@ from authentik.blueprints.tests import apply_blueprint
 from authentik.core.models import Application, Group, User
 from authentik.lib.generators import generate_id
 from authentik.providers.scim.clients.schema import ServiceProviderConfiguration
-from authentik.providers.scim.models import SCIMCompatibilityMode, SCIMMapping, SCIMProvider
+from authentik.providers.scim.models import (
+    SCIMCompatibilityMode,
+    SCIMMapping,
+    SCIMProvider,
+    SCIMProviderGroup,
+)
 from authentik.providers.scim.tasks import scim_sync
 from authentik.tenants.models import Tenant
 
@@ -464,3 +469,66 @@ class SCIMMembershipTests(TestCase):
                     ]
                 },
             )
+
+    def test_member_add_flatten_to_ancestor(self):
+        """Forced flatten: adding a user to a child group also pushes that user as a
+        direct member of every ancestor group."""
+        config = ServiceProviderConfiguration.default()
+        config.patch.supported = True
+
+        parent = Group.objects.create(name=generate_id())
+        child = Group.objects.create(name=generate_id())
+        child.parents.add(parent)
+        user = User.objects.create(username=generate_id())
+
+        user_scim_id = generate_id()
+        parent_post_id = generate_id()
+        child_post_id = generate_id()
+
+        with Mocker() as mocker:
+            mocker.get(
+                "https://localhost/ServiceProviderConfig",
+                json=config.model_dump(),
+            )
+            mocker.post("https://localhost/Users", json={"id": user_scim_id})
+            mocker.post(
+                "https://localhost/Groups",
+                [{"json": {"id": parent_post_id}}, {"json": {"id": child_post_id}}],
+            )
+
+            self.configure()
+            scim_sync.send(self.provider.pk)
+
+        # Resolve the real SCIM ids regardless of sync order
+        parent_id = SCIMProviderGroup.objects.get(provider=self.provider, group=parent).scim_id
+        child_id = SCIMProviderGroup.objects.get(provider=self.provider, group=child).scim_id
+
+        with Mocker() as mocker:
+            mocker.get(
+                "https://localhost/ServiceProviderConfig",
+                json=config.model_dump(),
+            )
+            mocker.patch(f"https://localhost/Groups/{child_id}", json={})
+            mocker.patch(f"https://localhost/Groups/{parent_id}", json={})
+            # patch_compare_users GETs the ancestor's current state before diffing
+            mocker.get(
+                f"https://localhost/Groups/{parent_id}",
+                json={"displayName": parent.name, "members": []},
+            )
+
+            child.users.add(user)
+
+            patched = [r for r in mocker.request_history if r.method == "PATCH"]
+            patched_urls = {r.url for r in patched}
+            # both the child itself and its ancestor were patched
+            self.assertIn(f"https://localhost/Groups/{child_id}", patched_urls)
+            self.assertIn(f"https://localhost/Groups/{parent_id}", patched_urls)
+            # the ancestor received the user via flattening
+            parent_added: set[str] = set()
+            for request in patched:
+                if not request.url.endswith(f"/Groups/{parent_id}"):
+                    continue
+                for op in request.json()["Operations"]:
+                    for value in op.get("value", []):
+                        parent_added.add(value["value"])
+            self.assertIn(user_scim_id, parent_added)
