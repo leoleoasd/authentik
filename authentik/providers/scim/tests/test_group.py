@@ -9,6 +9,7 @@ from requests_mock import Mocker
 from authentik.blueprints.tests import apply_blueprint
 from authentik.core.models import Application, Group, User
 from authentik.lib.generators import generate_id
+from authentik.providers.scim.clients.schema import ServiceProviderConfiguration
 from authentik.providers.scim.models import SCIMMapping, SCIMProvider, SCIMProviderGroup
 from authentik.providers.scim.tasks import scim_sync
 
@@ -113,6 +114,46 @@ class SCIMGroupTests(TestCase):
         self.assertEqual(mock.request_history[0].method, "GET")
         self.assertEqual(mock.request_history[1].method, "POST")
         self.assertEqual(mock.request_history[2].method, "PUT")
+
+    @Mocker()
+    def test_group_update_patch_includes_schemas(self, mock: Mocker):
+        """Regression: the general (non-AWS) PATCH update must include `schemas`.
+        Without it, strict endpoints (Slack) reject with 400 missing_schema_element,
+        which also blocks the subsequent member reconciliation."""
+        config = ServiceProviderConfiguration.default()
+        config.patch.supported = True
+        scim_id = generate_id()
+        mock.get("https://localhost/ServiceProviderConfig", json=config.model_dump())
+        mock.post("https://localhost/Groups", json={"id": scim_id})
+        mock.patch(f"https://localhost/Groups/{scim_id}", json={})
+        mock.get(
+            f"https://localhost/Groups/{scim_id}",
+            json={"displayName": "x", "members": []},
+        )
+
+        group = Group.objects.create(name=generate_id())
+        # trigger an update -> _update_patch -> _update_patch_general (non-AWS path)
+        group.name = generate_id()
+        group.save()
+
+        patch_bodies = [
+            loads(request.body)
+            for request in mock.request_history
+            if request.method == "PATCH" and request.url == f"https://localhost/Groups/{scim_id}"
+        ]
+        self.assertTrue(patch_bodies, "expected at least one PATCH to the group")
+        # the attribute-replace op carries the group payload; that body must include schemas
+        general = [
+            body
+            for body in patch_bodies
+            if any(
+                op.get("op") == "replace" and isinstance(op.get("value"), dict)
+                for op in body.get("Operations", [])
+            )
+        ]
+        self.assertTrue(general, "expected the general attribute-replace PATCH")
+        for body in general:
+            self.assertEqual(body.get("schemas"), ["urn:ietf:params:scim:api:messages:2.0:PatchOp"])
 
     @Mocker()
     def test_group_create_delete(self, mock: Mocker):

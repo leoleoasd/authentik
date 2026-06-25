@@ -250,8 +250,11 @@ class SCIMGroupClient(SCIMClient[Group, SCIMProviderGroup, SCIMGroupSchema]):
                     )
                 ]
             ).model_dump(
+                # NOTE: do NOT pass exclude_unset here. PatchRequest.schemas is a
+                # defaulted field that is never explicitly set, so exclude_unset would
+                # drop it and the body would ship without `schemas`, which Slack (and
+                # other strict SCIM endpoints) reject with 400 missing_schema_element.
                 mode="json",
-                exclude_unset=True,
                 exclude_none=True,
             ),
         )

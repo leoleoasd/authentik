@@ -346,6 +346,7 @@ class SCIMMembershipTests(TestCase):
             self.assertJSONEqual(
                 mocker.request_history[1].body,
                 {
+                    "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
                     "Operations": [
                         {
                             "op": "replace",
@@ -356,7 +357,7 @@ class SCIMMembershipTests(TestCase):
                                 "externalId": str(group.pk),
                             },
                         }
-                    ]
+                    ],
                 },
             )
 
@@ -456,6 +457,7 @@ class SCIMMembershipTests(TestCase):
             self.assertJSONEqual(
                 mocker.request_history[1].body,
                 {
+                    "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
                     "Operations": [
                         {
                             "op": "replace",
@@ -466,7 +468,7 @@ class SCIMMembershipTests(TestCase):
                                 "externalId": str(group.pk),
                             },
                         }
-                    ]
+                    ],
                 },
             )
 
